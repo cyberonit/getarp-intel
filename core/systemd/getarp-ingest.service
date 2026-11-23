@@ -1,0 +1,30 @@
+[Unit]
+StartLimitIntervalSec=0
+Description=getarp ingest (sensor logs in through the tunnel)
+After=wg-quick@wg0.service
+Wants=wg-quick@wg0.service
+
+[Service]
+User=getarp-ingest
+Group=getarp-logs
+UMask=0027
+EnvironmentFile=-/etc/getarp/ingest.env
+ExecStart=/usr/bin/python3 -I /opt/getarp/core/getarp-ingest.py
+# Fails until wg0 has its address; systemd keeps trying.
+Restart=always
+RestartSec=3
+ReadWritePaths=/var/lib/getarp/logs /var/lib/getarp/ingest
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_INET AF_UNIX
+IPAddressAllow=10.66.0.0/24
+IPAddressDeny=any
+
+[Install]
+WantedBy=multi-user.target

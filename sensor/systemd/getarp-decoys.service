@@ -1,0 +1,26 @@
+[Unit]
+Description=getarp extra decoys (HTTP, MySQL, FTP, Redis)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=hpextra
+Group=hpextra
+UMask=0027
+Environment=HP_LOG=/var/log/getarp/extra/extra.json
+ExecStart=/usr/bin/python3 -I /opt/getarp/sensor/decoys/services.py
+Restart=always
+RestartSec=5
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ReadWritePaths=/var/log/getarp/extra
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+MemoryMax=256M
+
+[Install]
+WantedBy=multi-user.target

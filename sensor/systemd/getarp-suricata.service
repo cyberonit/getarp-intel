@@ -1,0 +1,28 @@
+[Unit]
+Description=getarp Suricata IDS on the public interface
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=suricata
+Group=suricata
+UMask=0027
+EnvironmentFile=/etc/getarp/sensor.env
+AmbientCapabilities=CAP_NET_RAW CAP_NET_ADMIN CAP_SYS_NICE CAP_IPC_LOCK
+CapabilityBoundingSet=CAP_NET_RAW CAP_NET_ADMIN CAP_SYS_NICE CAP_IPC_LOCK
+LimitMEMLOCK=infinity
+RuntimeDirectory=suricata
+ExecStart=/usr/bin/suricata -c /etc/getarp/suricata.yaml --af-packet=${PUBLIC_IFACE} -l /var/log/getarp/suricata
+# USR2 reloads the rules without a restart.
+ExecReload=/bin/kill -USR2 $MAINPID
+Restart=always
+RestartSec=10
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+ReadWritePaths=/var/log/getarp/suricata /var/lib/suricata
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,82 @@
+%YAML 1.1
+---
+# getarp: lean Suricata settings for a honeypot sensor.
+# The capture interface is given on the command line (--af-packet=<iface>).
+
+vars:
+  address-groups:
+    HOME_NET: "any"          # the sensor IS the target; everything inbound is interesting
+    EXTERNAL_NET: "any"
+  port-groups:
+    HTTP_PORTS: "80,8080,8081"
+    SHELLCODE_PORTS: "!80"
+    ORACLE_PORTS: 1521
+    SSH_PORTS: "22,2222"
+    DNP3_PORTS: 20000
+    MODBUS_PORTS: 502
+    FILE_DATA_PORTS: "[$HTTP_PORTS,110,143]"
+    FTP_PORTS: "21,2121"
+    GENEVE_PORTS: 6081
+    VXLAN_PORTS: 4789
+    TEREDO_PORTS: 3544
+
+default-log-dir: /var/log/getarp/suricata
+
+af-packet:
+  - interface: default
+    cluster-id: 99
+    cluster-type: cluster_flow
+    defrag: yes
+    threads: 1
+
+outputs:
+  - eve-log:
+      enabled: yes
+      filetype: regular
+      filename: eve.json
+      types:
+        - alert:
+            payload: yes
+            payload-printable: yes
+            metadata: yes
+        - http:
+            extended: yes
+        - dns
+        - tls
+        - ssh
+        - flow
+        - anomaly
+  - stats:
+      enabled: no
+
+stats:
+  enabled: no
+
+default-rule-path: /var/lib/suricata/rules
+rule-files:
+  - suricata.rules                          # ET Open, from suricata-update
+  - /etc/getarp/getarp-local.rules          # getarp's own honeypot rules
+
+classification-file: /etc/suricata/classification.config
+reference-config-file: /etc/suricata/reference.config
+
+app-layer:
+  protocols:
+    http: {enabled: yes}
+    ssh:  {enabled: yes}
+    tls:  {enabled: yes}
+    dns:  {enabled: yes}
+    ftp:  {enabled: yes}
+
+unix-command:
+  enabled: no
+
+logging:
+  default-log-level: notice
+  outputs:
+    - console: {enabled: yes}
+    - file: {enabled: no}
+    - syslog: {enabled: no}
+
+detect:
+  profile: low

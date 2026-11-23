@@ -1,0 +1,14 @@
+/var/lib/getarp/logs/*.json {
+	daily
+	rotate 7
+	compress
+	delaycompress
+	missingok
+	notifempty
+	su getarp-ingest getarp-logs
+	create 0640 getarp-ingest getarp-logs
+	sharedscripts
+	postrotate
+		systemctl kill -s HUP getarp-ingest.service >/dev/null 2>&1 || true
+	endscript
+}

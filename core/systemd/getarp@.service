@@ -1,0 +1,33 @@
+# One unit for the four application services:
+#   getarp@pipeline  getarp@enrichment  getarp@analytics  getarp@api
+# Each runs as its own account (svc-<name>) with its own database and Redis user.
+[Unit]
+StartLimitIntervalSec=0
+Description=getarp %i
+After=network-online.target postgresql.service redis-server.service
+Wants=network-online.target
+
+[Service]
+User=svc-%i
+Group=svc-%i
+SupplementaryGroups=redis
+EnvironmentFile=/etc/getarp/app.env
+EnvironmentFile=/etc/getarp/svc/%i.env
+Environment=PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1
+WorkingDirectory=/opt/getarp/app/%i
+# GETARP_ARGS comes from /etc/getarp/svc/%i.env
+ExecStart=/opt/getarp/venv/bin/python $GETARP_ARGS
+Restart=always
+RestartSec=5
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+
+[Install]
+WantedBy=multi-user.target

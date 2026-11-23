@@ -1,0 +1,7 @@
+[Unit]
+Description=getarp database backup
+After=postgresql.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/getarp-ctl backup

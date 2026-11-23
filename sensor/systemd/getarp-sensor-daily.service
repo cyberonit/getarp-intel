@@ -1,0 +1,9 @@
+[Unit]
+Description=getarp sensor daily: refresh IDS rules, remove old decoy logs
+After=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/suricata-update --suricata-conf /etc/getarp/suricata.yaml --no-reload --quiet
+ExecStart=/bin/systemctl try-reload-or-restart getarp-suricata.service
+ExecStart=/usr/bin/find /var/log/getarp/cowrie -name cowrie.json.* -mtime +7 -delete

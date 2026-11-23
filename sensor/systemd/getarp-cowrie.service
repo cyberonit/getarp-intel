@@ -1,0 +1,28 @@
+[Unit]
+Description=getarp Cowrie decoy (SSH and Telnet)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=cowrie
+Group=cowrie
+# Public 22/23 are redirected to 2222/2223 by the firewall.
+WorkingDirectory=/var/lib/cowrie
+StateDirectory=cowrie
+StateDirectoryMode=0750
+ExecStart=/opt/cowrie/venv/bin/twistd -n --umask=0027 --pidfile= cowrie
+Restart=always
+RestartSec=5
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ReadWritePaths=/var/log/getarp/cowrie
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+MemoryMax=512M
+
+[Install]
+WantedBy=multi-user.target

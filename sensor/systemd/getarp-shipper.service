@@ -1,0 +1,31 @@
+[Unit]
+StartLimitIntervalSec=0
+Description=getarp shipper (sensor logs to the core, through the tunnel)
+After=wg-quick@wg0.service
+Wants=wg-quick@wg0.service
+
+[Service]
+# Only this account may reach the core's ingest (see the sensor firewall).
+User=getarp-ship
+Group=getarp-ship
+SupplementaryGroups=getarp-logs
+EnvironmentFile=-/etc/getarp/shipper.env
+StateDirectory=getarp-shipper
+StateDirectoryMode=0750
+ExecStart=/usr/bin/python3 -I /opt/getarp/sensor/getarp-shipper.py
+Restart=always
+RestartSec=5
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_INET AF_UNIX
+IPAddressAllow=10.66.0.1
+IPAddressDeny=any
+
+[Install]
+WantedBy=multi-user.target

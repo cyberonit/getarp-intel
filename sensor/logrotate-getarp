@@ -1,0 +1,24 @@
+/var/log/getarp/suricata/eve.json {
+	daily
+	rotate 3
+	compress
+	delaycompress
+	missingok
+	notifempty
+	su suricata getarp-logs
+	create 0640 suricata getarp-logs
+	postrotate
+		systemctl kill -s HUP getarp-suricata.service >/dev/null 2>&1 || true
+	endscript
+}
+
+/var/log/getarp/extra/extra.json {
+	daily
+	rotate 7
+	compress
+	delaycompress
+	missingok
+	notifempty
+	su hpextra getarp-logs
+	create 0640 hpextra getarp-logs
+}

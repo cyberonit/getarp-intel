@@ -1,0 +1,16 @@
+# getarp: what CrowdSec reads on the core.
+# Sensor logs arrive through the ingest and are written here, one file per kind.
+filenames:
+  - /var/lib/getarp/logs/cowrie.json
+labels:
+  type: cowrie
+---
+filenames:
+  - /var/lib/getarp/logs/eve.json
+labels:
+  type: suricata-evelogs
+---
+filenames:
+  - /var/log/caddy/access.log
+labels:
+  type: caddy
