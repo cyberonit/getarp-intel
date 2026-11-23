@@ -1,0 +1,10 @@
+[Unit]
+Description=Monthly refresh of the getarp country and network data
+
+[Timer]
+OnCalendar=*-*-04 05:41:00
+RandomizedDelaySec=2h
+Persistent=true
+
+[Install]
+WantedBy=timers.target

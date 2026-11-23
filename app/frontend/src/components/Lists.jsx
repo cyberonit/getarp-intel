@@ -1,79 +1,91 @@
-import React, { useEffect, useState } from 'react'
-import { api } from '../lib/api.js'
+import React, { useState } from 'react'
+import { api, num, stamp } from '../api.js'
+import { Card, Empty, Ip, Score, Tag, WindowSelect, usePoll } from './ui.jsx'
 
-const fmt = (t) => new Date(t).toLocaleString()
+const SEVERITY = { 1: 'low', 2: 'medium', 3: 'high', 4: 'critical' }
+
+function evidence(f) {
+  const d = f.detail || {}
+  switch (f.type) {
+    case 'bruteforce':
+    case 'credential_stuffing':
+      return `${d.attempts} attempts · ${(d.usernames || []).slice(0, 4).join(', ')}`
+    case 'access': return `logged in as ${d.username ?? '?'}`
+    case 'command_exec': return d.command
+    case 'malware_download': return d.url
+    case 'ids_alert': return d.signature
+    default: return ''
+  }
+}
+
+function Page({ title, load, render, empty }) {
+  const [w, setW] = useState('24h')
+  const [rows, error] = usePoll(() => load(w), [w])
+  return (
+    <Card title={title} right={<><span className="count">{rows ? num(rows.length) : ''}</span>
+      <WindowSelect value={w} onChange={setW} /></>}>
+      {error && <Empty>could not load: {error.message}</Empty>}
+      {rows && !rows.length && <Empty>{empty}</Empty>}
+      {rows?.length > 0 && render(rows)}
+    </Card>
+  )
+}
 
 export function Scans({ onPick }) {
-  const [rows, setRows] = useState([])
-  useEffect(() => { api.scans().then(setRows).catch(() => {}) }, [])
   return (
-    <div className="card"><h3><span>scan correlation</span><span>{rows.length}</span></h3>
-      <div className="body"><table>
-        <thead><tr><th>time</th><th>ip</th><th>type</th><th>ports</th><th>port list</th></tr></thead>
-        <tbody>{rows.map((r) => (
-          <tr key={r.id}><td className="muted">{fmt(r.ts)}</td>
-            <td className="ip" onClick={() => onPick(r.src_ip)}>{r.src_ip}</td>
-            <td><span className="tag scanner">{r.scan_type}</span></td>
-            <td>{r.port_count}</td><td className="muted">{(r.ports || []).join(' ')}</td></tr>
-        ))}</tbody></table></div></div>
+    <Page title="scans" empty="no scans in this window" load={(w) => api.findings('scan', w)}
+      render={(rows) => (
+        <table>
+          <thead><tr><th>time</th><th>ip</th><th>type</th><th>ports</th><th>country</th>
+            <th>as</th><th>sensor</th></tr></thead>
+          <tbody>{rows.map((r, i) => (
+            <tr key={i}><td className="faint">{stamp(r.ts)}</td><td><Ip ip={r.ip} onPick={onPick} /></td>
+              <td><Tag tone="scanner">{r.type.replace('_', ' ')}</Tag></td>
+              <td className="faint">{(r.detail?.ports || []).join(' ')}</td>
+              <td>{r.country || '—'}</td><td className="org">{r.as_org || '—'}</td>
+              <td className="faint">{r.sensor}</td></tr>
+          ))}</tbody>
+        </table>
+      )} />
   )
 }
 
 export function Attacks({ onPick }) {
-  const [rows, setRows] = useState([])
-  useEffect(() => { api.attacks().then(setRows).catch(() => {}) }, [])
   return (
-    <div className="card"><h3><span>attack correlation</span><span>{rows.length}</span></h3>
-      <div className="body"><table>
-        <thead><tr><th>time</th><th>ip</th><th>type</th><th>service</th><th>sev</th><th>evidence</th></tr></thead>
-        <tbody>{rows.map((r) => (
-          <tr key={r.id}><td className="muted">{fmt(r.ts)}</td>
-            <td className="ip" onClick={() => onPick(r.src_ip)}>{r.src_ip}</td>
-            <td><span className="tag exploiter">{r.attack_type}</span></td>
-            <td>{r.service || '—'}</td><td>{r.severity}</td>
-            <td className="muted">{JSON.stringify(r.evidence).slice(0, 70)}</td></tr>
-        ))}</tbody></table></div></div>
+    <Page title="attacks" empty="no attacks in this window" load={(w) => api.findings('attack', w)}
+      render={(rows) => (
+        <table>
+          <thead><tr><th>time</th><th>ip</th><th>type</th><th>service</th><th>severity</th>
+            <th>evidence</th><th>sensor</th></tr></thead>
+          <tbody>{rows.map((r, i) => (
+            <tr key={i}><td className="faint">{stamp(r.ts)}</td><td><Ip ip={r.ip} onPick={onPick} /></td>
+              <td><Tag tone="attack">{r.type.replace('_', ' ')}</Tag></td>
+              <td>{r.service || '—'}</td>
+              <td><span className={`sev s${r.severity}`}>{SEVERITY[r.severity]}</span></td>
+              <td className="evidence" title={evidence(r)}>{evidence(r)}</td>
+              <td className="faint">{r.sensor}</td></tr>
+          ))}</tbody>
+        </table>
+      )} />
   )
 }
 
 export function Behavior({ onPick }) {
-  const [rows, setRows] = useState([])
-  useEffect(() => { api.behavior().then(setRows).catch(() => {}) }, [])
   return (
-    <div className="card"><h3><span>behavioral profiles</span><span>{rows.length}</span></h3>
-      <div className="body"><table>
-        <thead><tr><th>ip</th><th>score</th><th>sessions</th><th>tooling</th><th>tactics</th></tr></thead>
-        <tbody>{rows.map((r) => (
-          <tr key={r.src_ip}>
-            <td className="ip" onClick={() => onPick(r.src_ip)}>{r.src_ip}</td>
-            <td className="score s-hi">{Math.round(r.threat_score)}</td>
-            <td>{r.sessions}</td>
-            <td className="muted">{(r.tooling_hints || []).join(', ') || '—'}</td>
-            <td className="muted">{(r.tactics || []).join(', ') || '—'}</td></tr>
-        ))}</tbody></table></div></div>
-  )
-}
-
-export function Reports() {
-  const [rows, setRows] = useState([])
-  const [html, setHtml] = useState('')
-  useEffect(() => { api.reports().then(setRows).catch(() => {}) }, [])
-  return (
-    <div className="grid2">
-      <div className="card"><h3><span>reports</span><span>{rows.length}</span></h3>
-        <div className="body"><table>
-          <thead><tr><th>created</th><th>kind</th><th>events</th><th></th></tr></thead>
+    <Page title="behaviour" empty="no intruder activity in this window" load={(w) => api.behavior(w)}
+      render={(rows) => (
+        <table>
+          <thead><tr><th>ip</th><th>score</th><th>class</th><th>country</th>
+            <th className="n">sessions</th><th className="n">commands</th><th>tooling</th>
+            <th>tactics</th></tr></thead>
           <tbody>{rows.map((r) => (
-            <tr key={r.id}><td className="muted">{fmt(r.created_at)}</td><td>{r.kind}</td>
-              <td>{r.summary?.events ?? '—'}</td>
-              <td><a onClick={() => api.report(r.id).then((d) => setHtml(d.html))}>view</a></td></tr>
-          ))}</tbody></table>
-          {rows.length === 0 && <div className="muted">no reports yet — first daily report runs at 06:00 UTC</div>}
-        </div></div>
-      <div className="card"><h3><span>preview</span></h3>
-        <div className="body" style={{ background: '#fff', borderRadius: 8, minHeight: 200 }}
-          dangerouslySetInnerHTML={{ __html: html || '<p style="color:#888;font-family:monospace;padding:12px">select a report</p>' }} />
-      </div>
-    </div>
+            <tr key={r.ip}><td><Ip ip={r.ip} onPick={onPick} /></td><td><Score value={r.score} /></td>
+              <td><Tag>{r.class}</Tag></td><td>{r.country || '—'}</td>
+              <td className="n">{r.sessions}</td><td className="n">{r.commands}</td>
+              <td className="faint">{(r.tooling || []).join(', ') || '—'}</td>
+              <td className="faint">{(r.tactics || []).join(', ') || '—'}</td></tr>
+          ))}</tbody>
+        </table>
+      )} />
   )
 }

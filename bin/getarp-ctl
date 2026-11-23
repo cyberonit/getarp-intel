@@ -1,30 +1,29 @@
 #!/usr/bin/env bash
-# getarp-ctl — day-to-day operations for a getarp core or sensor.
+# getarp-ctl: day-to-day operations for a getarp core or sensor.
 #
 # On the core:
-#   getarp-ctl status                                  services, tunnel and sensors at a glance
-#   getarp-ctl info                                    what a new sensor or admin laptop needs to connect
-#   getarp-ctl sensor add <name> <tunnel-ip> <public-key> <public-ip>
-#   getarp-ctl sensor remove <name>                    revoke now; its address is never reused
-#   getarp-ctl admin add <name> <tunnel-ip> <public-key>   prints the laptop's tunnel config
+#   getarp-ctl status                          services and sensors at a glance
+#   getarp-ctl sensor add <name> <public-ip>   register a sensor; prints its key and install command
+#   getarp-ctl sensor move <name> <public-ip>  the sensor's public address changed
+#   getarp-ctl sensor remove <name>            revoke now; the name is never reused
+#   getarp-ctl admin add <name> <ip[/bits]>    allow admin access (sign-in, IP detail) from there
 #   getarp-ctl admin remove <name>
-#   getarp-ctl list                                    every registered peer
-#   getarp-ctl apply                                   rebuild tunnel, firewall and allowlist from the registry
-#   getarp-ctl backup                                  database dump now (also runs daily)
-#   getarp-ctl password <username>                     set a dashboard login's password (creates it if new)
+#   getarp-ctl list                            every registered sensor and admin address
+#   getarp-ctl apply                           rebuild firewall, web server and allowlist from the registry
+#   getarp-ctl backup                          database dump now (also runs nightly)
+#   getarp-ctl password <username>             set a dashboard login's password (creates it if new)
+#   getarp-ctl info                            what this core is and how to add things
 #
 # On a sensor:
 #   getarp-ctl status | info | apply
-#
-# Addresses: core 10.66.0.1 · admin laptops 10.66.0.2–10 · sensors 10.66.0.11–250
 # shellcheck disable=SC2015
 set -euo pipefail
 
 ETC=${GETARP_ETC:-/etc/getarp}
-WG_DIR=${GETARP_WG_DIR:-/etc/wireguard}
 LIB=${GETARP_LIB:-/var/lib/getarp}
+CADDYFILE=${GETARP_CADDYFILE:-/etc/caddy/Caddyfile}
 PEERS="$ETC/peers.csv"
-PEERS_HEADER="kind,name,tunnel_ip,pubkey,public_ip,enabled"
+PEERS_HEADER="kind,name,secret,address,enabled"
 NFT_FILE="$ETC/nftables.nft"
 DRY_RUN=${GETARP_DRY_RUN:-0}   # 1 = render files only, touch no live service (tests)
 
@@ -45,146 +44,73 @@ load_env() {
 }
 
 # ---------------------------------------------------------------- validation
-ip_last_octet() { # prints N for 10.66.0.N, or fails
-  [[ "$1" =~ ^10\.66\.0\.([0-9]{1,3})$ ]] || return 1
-  local n=${BASH_REMATCH[1]}
-  [ "$n" -ge 0 ] && [ "$n" -le 255 ] || return 1
-  echo "$n"
-}
 valid_name() { [[ "$1" =~ ^[a-z][a-z0-9-]{1,30}$ ]]; }
-valid_key() { [[ "$1" =~ ^[A-Za-z0-9+/]{42}[AEIMQUYcgkosw048]=$ ]]; }
 valid_ipv4() {
   [[ "$1" =~ ^([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})$ ]] || return 1
   local o; for o in "${BASH_REMATCH[@]:1}"; do [ "$o" -le 255 ] || return 1; done
 }
+valid_cidr() {
+  local ip=${1%/*} bits=32
+  [[ "$1" == */* ]] && bits=${1#*/}
+  valid_ipv4 "$ip" && [[ "$bits" =~ ^[0-9]{1,2}$ ]] && [ "$bits" -ge 8 ] && [ "$bits" -le 32 ]
+}
+sha256() { printf '%s' "$1" | sha256sum | cut -d' ' -f1; }
 
 # ---------------------------------------------------------------- registry
 ensure_registry() { [ -f "$PEERS" ] || { echo "$PEERS_HEADER" > "$PEERS"; chmod 0644 "$PEERS"; }; }
+peers_rows() { tail -n +2 "$PEERS"; }   # kind,name,secret,address,enabled
+enabled() { peers_rows | awk -F, -v k="$1" '$1==k && $5=="yes" {print $4}'; }   # addresses
+join_list() { paste -sd, - | sed 's/,/, /g'; }
 
-peers_rows() { tail -n +2 "$PEERS"; }  # kind,name,tunnel_ip,pubkey,public_ip,enabled
-
-enabled_rows() { peers_rows | awk -F, -v k="$1" '$1==k && $6=="yes"'; }
-
-registry_add() { # kind name tunnel_ip pubkey public_ip
-  local kind=$1 name=$2 ip=$3 key=$4 pub=${5:-}
-  valid_name "$name" || die "name must be lowercase letters, digits and dashes, e.g. s01"
-  valid_key "$key" || die "that is not a WireGuard public key (44 characters ending in =)"
-  local n; n=$(ip_last_octet "$ip") || die "tunnel address must be 10.66.0.N"
-  if [ "$kind" = sensor ]; then
-    { [ "$n" -ge 11 ] && [ "$n" -le 250 ]; } || die "sensor addresses are 10.66.0.11 to 10.66.0.250"
-    valid_ipv4 "$pub" || die "give the sensor's public IPv4 address"
-  else
-    { [ "$n" -ge 2 ] && [ "$n" -le 10 ]; } || die "admin addresses are 10.66.0.2 to 10.66.0.10"
-  fi
+registry_add() { # kind name secret-hash address
   ensure_registry
-  # Names and addresses are never reused, not even after removal.
-  if peers_rows | awk -F, -v n="$name" '$2==n{f=1} END{exit !f}'; then
-    die "the name $name is (or was) registered; pick a new one"
+  if peers_rows | awk -F, -v n="$2" '$2==n{f=1} END{exit !f}'; then
+    die "the name $2 is (or was) registered; pick a new one"
   fi
-  if peers_rows | awk -F, -v a="$ip" '$3==a{f=1} END{exit !f}'; then
-    die "$ip is (or was) used by another peer; pick a new address"
-  fi
-  if peers_rows | awk -F, -v k="$key" '$4==k{f=1} END{exit !f}'; then
-    die "that public key is already registered"
-  fi
-  echo "$kind,$name,$ip,$key,$pub,yes" >> "$PEERS"
+  echo "$1,$2,$3,$4,yes" >> "$PEERS"
 }
 
-registry_disable() { # kind name
+registry_set() { # kind name column value   (column: 4 = address, 5 = enabled)
   ensure_registry
-  peers_rows | awk -F, -v k="$1" -v n="$2" '$1==k && $2==n && $6=="yes"{f=1} END{exit !f}' \
+  peers_rows | awk -F, -v k="$1" -v n="$2" '$1==k && $2==n && $5=="yes"{f=1} END{exit !f}' \
     || die "no active $1 called $2"
   local tmp; tmp=$(mktemp "$ETC/peers.XXXXXX")
-  awk -F, -v OFS=, -v k="$1" -v n="$2" 'NR>1 && $1==k && $2==n {$6="no"} {print}' "$PEERS" > "$tmp"
+  awk -F, -v OFS=, -v k="$1" -v n="$2" -v c="$3" -v v="$4" 'NR>1 && $1==k && $2==n {$c=v} {print}' \
+    "$PEERS" > "$tmp"
   chmod 0644 "$tmp"
   mv "$tmp" "$PEERS"
 }
 
 # ---------------------------------------------------------------- core: render
-render_wg_core() {
-  load_env core
-  local tmp; tmp=$(mktemp "$WG_DIR/wg0.conf.XXXXXX")
-  {
-    echo "# Written by getarp-ctl from $PEERS. Do not edit by hand."
-    echo "[Interface]"
-    echo "Address = 10.66.0.1/24"
-    echo "ListenPort = ${WG_PORT:-51820}"
-    echo "PrivateKey = $(cat "$WG_DIR/private.key")"
-    local kind name ip key pub en
-    while IFS=, read -r kind name ip key pub en; do
-      [ "$en" = yes ] || continue
-      echo
-      echo "# $kind $name${pub:+ ($pub)}"
-      echo "[Peer]"
-      echo "PublicKey = $key"
-      echo "AllowedIPs = $ip/32"
-    done < <(peers_rows)
-  } > "$tmp"
-  chmod 0600 "$tmp"
-  mv "$tmp" "$WG_DIR/wg0.conf"
-  if live && ip link show wg0 >/dev/null 2>&1; then
-    wg syncconf wg0 <(wg-quick strip wg0)
-  fi
-}
-
 render_nft_core() {
   load_env core
-  local sensors; sensors=$(enabled_rows sensor | cut -d, -f3 | paste -sd, - | sed 's/,/, /g')
   local tmp; tmp=$(mktemp "$ETC/nftables.XXXXXX")
   cat > "$tmp" <<EOF
 #!/usr/sbin/nft -f
-# getarp core firewall. Written by getarp-ctl; edit the registry, not this file.
-# Lives in its own table: never touches CrowdSec's tables or anything else.
+# getarp core firewall. Written by getarp-ctl. Lives in its own table: never
+# touches CrowdSec's tables or anything else.
 
 table inet getarp
 delete table inet getarp
 
 table inet getarp {
-	# registered, enabled sensors (tunnel addresses)
-	set sensors {
-		type ipv4_addr
-$( [ -n "$sensors" ] && printf '\t\telements = { %s }\n' "$sensors" )
-	}
-
-	set admins {
-		type ipv4_addr
-		flags interval
-		elements = { 10.66.0.2-10.66.0.10 }
-	}
-
 	chain input {
 		type filter hook input priority filter; policy drop;
 		ct state established,related accept
 		ct state invalid drop
 		iifname "lo" accept
-		meta l4proto icmp accept
+		meta l4proto { icmp, ipv6-icmp } accept
 
-		# tunnel addresses only ever arrive through the tunnel
-		iifname != "wg0" ip daddr 10.66.0.0/24 drop
-
-		# public: the dashboard, the tunnel, admin SSH
-		iifname != "wg0" tcp dport { 80, 443 } accept
-		udp dport ${WG_PORT:-51820} accept
-		iifname != "wg0" tcp dport { ${SSH_PORTS} } accept
-
-		# tunnel: sensors may only push logs; admins may reach the admin site
-		iifname "wg0" ip saddr @sensors ip daddr 10.66.0.1 tcp dport 6000 accept
-		iifname "wg0" ip saddr @admins ip daddr 10.66.0.1 tcp dport 443 accept
+		# the dashboard, and the sensors' log delivery (both HTTPS, through Caddy)
+		tcp dport { 80, 443 } accept
+		# admin SSH
+		tcp dport { ${SSH_PORTS} } accept
 
 		limit rate 10/minute log prefix "getarp-in-drop " level info
 	}
 
 	chain forward {
 		type filter hook forward priority filter; policy drop;
-		ct state established,related accept
-		# admin laptops may SSH to a sensor through the core; nothing else crosses
-		iifname "wg0" oifname "wg0" ip saddr @admins ip daddr @sensors tcp dport 2022 accept
-	}
-
-	chain output {
-		type filter hook output priority filter; policy accept;
-		# the core never opens a connection to a sensor
-		oifname "wg0" ip daddr 10.66.0.11-10.66.0.250 ct state new drop
 	}
 }
 EOF
@@ -196,24 +122,123 @@ EOF
   if live; then nft -f "$NFT_FILE"; fi
 }
 
+render_caddy() {
+  load_env core
+  local sensors admins
+  sensors=$(enabled sensor | tr '\n' ' ' | sed 's/ *$//')
+  admins=$(enabled admin | tr '\n' ' ' | sed 's/ *$//')
+  local tmp; tmp=$(mktemp "$(dirname "$CADDYFILE")/.Caddyfile.XXXXXX")
+  {
+    cat <<EOF
+# getarp. Written by getarp-ctl from $PEERS; run "getarp-ctl apply" after changes.
+{
+	email ${EMAIL}
+}
+
+(security_headers) {
+	header {
+		Strict-Transport-Security "max-age=31536000"
+		X-Content-Type-Options nosniff
+		X-Frame-Options DENY
+		Referrer-Policy no-referrer
+		Content-Security-Policy "default-src 'self'; connect-src 'self' wss:; img-src 'self' data:; style-src 'self'; frame-ancestors 'none'"
+		-Server
+	}
+}
+
+${DOMAIN} {
+	bind ${BIND_IP}
+	encode gzip
+	import security_headers
+	log {
+		output file /var/log/caddy/access.log {
+			roll_size 50MiB
+			roll_keep 5
+		}
+	}
+
+EOF
+    if [ -n "$sensors" ]; then
+      cat <<EOF
+	# log delivery: registered sensors only (each also needs its own key)
+	@sensors {
+		path /ingest
+		remote_ip ${sensors}
+	}
+	handle @sensors {
+		request_body {
+			max_size 8MB
+		}
+		reverse_proxy 127.0.0.1:6000
+	}
+EOF
+    fi
+    if [ -n "$admins" ]; then
+      cat <<EOF
+	# admin access (sign-in, per-IP detail): registered admin addresses only
+	@admin_api {
+		path /api/*
+		remote_ip ${admins}
+	}
+	handle @admin_api {
+		reverse_proxy 127.0.0.1:8000
+	}
+EOF
+    fi
+    cat <<EOF
+	# everyone else: the read-only public routes
+	@public_api path /api/status /api/ips /api/top-countries /api/top-as /api/findings /api/behavior /api/ws /api/health
+	handle @public_api {
+		reverse_proxy 127.0.0.1:8000
+	}
+	handle /api/* {
+		respond 404
+	}
+	handle /ingest {
+		respond 404
+	}
+	handle /assets/* {
+		header Cache-Control "public, max-age=31536000, immutable"
+		root * /var/www/getarp
+		file_server
+	}
+	handle {
+		root * /var/www/getarp
+		try_files {path} /index.html
+		file_server
+	}
+}
+EOF
+  } > "$tmp"
+  chmod 0644 "$tmp"
+  if live; then
+    runuser -u caddy -- env HOME=/var/lib/caddy caddy validate --adapter caddyfile --config "$tmp" \
+      >/dev/null 2>&1 || { rm -f "$tmp"; die "the new web server config did not validate; nothing changed"; }
+  fi
+  mv "$tmp" "$CADDYFILE"
+  if live && systemctl is-active --quiet caddy; then systemctl reload caddy; fi
+}
+
 render_crowdsec_allowlist() {
   load_env core
   local dir=${GETARP_CROWDSEC_DIR:-/etc/crowdsec}/parsers/s02-enrich
   [ -d "$dir" ] || { live && return 0; mkdir -p "$dir"; }
   local tmp; tmp=$(mktemp "$dir/.getarp-whitelist.XXXXXX")
   {
-    echo "# Written by getarp-ctl. getarp's own addresses are never banned."
+    echo "# Written by getarp-ctl. getarp's own and admin addresses are never banned."
     echo "name: getarp/whitelist"
-    echo "description: getarp infrastructure"
+    echo "description: getarp infrastructure and admins"
     echo "whitelist:"
     echo "  reason: getarp infrastructure"
     echo "  ip:"
     echo "    - \"127.0.0.1\""
     [ -n "${PUBLIC_IP:-}" ] && echo "    - \"$PUBLIC_IP\""
     [ -n "${BIND_IP:-}" ] && echo "    - \"$BIND_IP\""
-    enabled_rows sensor | cut -d, -f5 | awk 'NF{print "    - \"" $0 "\""}'
-    echo "  cidr:"
-    echo "    - \"10.66.0.0/24\""
+    enabled sensor | awk 'NF{print "    - \"" $0 "\""}'
+    if [ -n "$(enabled admin)" ]; then
+      echo "  cidr:"
+      enabled admin | awk 'NF{ c = ($0 ~ /\//) ? $0 : $0 "/32"; print "    - \"" c "\""}'
+    fi
   } > "$tmp"
   chmod 0644 "$tmp"
   if cmp -s "$tmp" "$dir/getarp-whitelist.yaml"; then
@@ -233,10 +258,10 @@ render_nft_sensor() {
   for u in root _apt systemd-resolve systemd-timesync _chrony; do
     getent passwd "$u" >/dev/null && users+=("\"$u\"")
   done
-  local userset; userset=$(IFS=,; echo "${users[*]}" | sed 's/,/, /g')
+  local userset; userset=$(IFS=,; echo "${users[*]}"); userset=${userset//,/, }
   local admin_rule=""
   if [ -n "${ADMIN_CIDR:-}" ]; then
-    admin_rule="iifname \"${PUBLIC_IFACE}\" ip saddr ${ADMIN_CIDR} tcp dport 2022 accept"
+    admin_rule="iifname \"${PUBLIC_IFACE}\" ip saddr { ${ADMIN_CIDR//,/, } } tcp dport 2022 accept"
   fi
   local tmp; tmp=$(mktemp "$ETC/nftables.XXXXXX")
   cat > "$tmp" <<EOF
@@ -263,16 +288,12 @@ table inet getarp {
 		ct state established,related accept
 		ct state invalid drop
 		iifname "lo" accept
-		meta l4proto icmp accept
+		meta l4proto { icmp, ipv6-icmp } accept
 
 		# decoys
 		iifname "${PUBLIC_IFACE}" tcp dport { 2222, 2223, 8080, 8081, 2121, 3306, 6379 } accept
 
-		# the tunnel to the core
-		ip saddr ${CORE_IP} udp sport ${WG_PORT:-51820} accept
-
-		# admin SSH: through the tunnel, plus the installing address if one was given
-		iifname "wg0" ip saddr 10.66.0.2-10.66.0.10 tcp dport 2022 accept
+		# real SSH: admin addresses only
 		${admin_rule}
 	}
 
@@ -285,8 +306,9 @@ table inet getarp {
 		ct state established,related accept
 		oifname "lo" accept
 
-		ip daddr ${CORE_IP} udp dport ${WG_PORT:-51820} accept
-		oifname "wg0" ip daddr 10.66.0.1 tcp dport 6000 meta skuid "getarp-ship" accept
+		# log delivery: only the shipper, only to the core, only HTTPS
+		meta skuid "getarp-ship" ip daddr ${CORE_IP} tcp dport 443 accept
+		meta skuid "getarp-ship" meta l4proto { tcp, udp } th dport 53 accept
 
 		# updates, names and time for the system accounts only
 		meta skuid { ${userset} } udp dport { 53, 123 } accept
@@ -308,7 +330,7 @@ EOF
 cmd_apply() {
   need_root
   case $(role) in
-    core) ensure_registry; render_wg_core; render_nft_core; render_crowdsec_allowlist ;;
+    core) ensure_registry; render_nft_core; render_caddy; render_crowdsec_allowlist ;;
     sensor) render_nft_sensor ;;
   esac
   say "applied"
@@ -319,53 +341,57 @@ cmd_sensor() {
   [ "$(role)" = core ] || die "sensors are managed on the core"
   case ${1:-} in
     add)
-      [ $# -eq 5 ] || die "usage: getarp-ctl sensor add <name> <tunnel-ip> <public-key> <public-ip>"
-      registry_add sensor "$2" "$3" "$4" "$5"
+      [ $# -eq 3 ] || die "usage: getarp-ctl sensor add <name> <public-ip>"
+      valid_name "$2" || die "name: lowercase letters, digits and dashes, e.g. s01"
+      valid_ipv4 "$3" || die "give the sensor's public IPv4 address"
+      local key; key=$(openssl rand -hex 32)
+      registry_add sensor "$2" "$(sha256 "$key")" "$3"
       cmd_apply >/dev/null
-      say "sensor $2 added at $3. On the sensor, 'getarp-ctl status' should show a handshake within a minute."
+      load_env core
+      cat <<EOF
+[getarp] sensor $2 registered at $3.
+
+  Its key (shown only now; the core keeps only a hash of it):
+    $key
+
+  On the sensor machine, from the getarp-intel folder:
+    sudo ./install.sh sensor --core https://${DOMAIN} --key $key
+EOF
+      ;;
+    move)
+      [ $# -eq 3 ] || die "usage: getarp-ctl sensor move <name> <new-public-ip>"
+      valid_ipv4 "$3" || die "give the sensor's new public IPv4 address"
+      registry_set sensor "$2" 4 "$3"
+      cmd_apply >/dev/null
+      say "sensor $2 now delivers from $3"
       ;;
     remove)
       [ $# -eq 2 ] || die "usage: getarp-ctl sensor remove <name>"
-      registry_disable sensor "$2"
+      registry_set sensor "$2" 5 no
       cmd_apply >/dev/null
-      say "sensor $2 revoked: its tunnel key is gone and the ingest refuses it. Collected data is kept."
+      say "sensor $2 revoked: its key and address no longer work. Collected data is kept."
       ;;
-    *) die "usage: getarp-ctl sensor add|remove ..." ;;
+    *) die "usage: getarp-ctl sensor add|move|remove ..." ;;
   esac
 }
 
 cmd_admin() {
   need_root
-  [ "$(role)" = core ] || die "admin laptops are managed on the core"
+  [ "$(role)" = core ] || die "admin addresses are managed on the core"
   case ${1:-} in
     add)
-      [ $# -eq 4 ] || die "usage: getarp-ctl admin add <name> <tunnel-ip> <public-key>"
-      registry_add admin "$2" "$3" "$4" ""
+      [ $# -eq 3 ] || die "usage: getarp-ctl admin add <name> <ip or ip/bits>"
+      valid_name "$2" || die "name: lowercase letters, digits and dashes, e.g. office"
+      valid_cidr "$3" || die "give an IPv4 address or range, e.g. 203.0.113.7 or 203.0.113.0/24"
+      registry_add admin "$2" "" "$3"
       cmd_apply >/dev/null
-      load_env core
-      cat <<EOF
-[getarp] admin $2 added. Put this in the laptop's WireGuard config
-         (replace the private key with the one made on the laptop):
-
-[Interface]
-Address = $3/32
-PrivateKey = <the laptop's private key>
-
-[Peer]
-PublicKey = $(cat "$WG_DIR/public.key")
-Endpoint = ${PUBLIC_IP}:${WG_PORT:-51820}
-AllowedIPs = 10.66.0.0/24
-PersistentKeepalive = 25
-
-Then add this line to the laptop's hosts file:
-10.66.0.1  ${ADMIN_DOMAIN:-admin.getarp.internal}
-EOF
+      say "admin access allowed from $3 ($2): sign in on the dashboard from there"
       ;;
     remove)
       [ $# -eq 2 ] || die "usage: getarp-ctl admin remove <name>"
-      registry_disable admin "$2"
+      registry_set admin "$2" 5 no
       cmd_apply >/dev/null
-      say "admin $2 removed"
+      say "admin address $2 removed"
       ;;
     *) die "usage: getarp-ctl admin add|remove ..." ;;
   esac
@@ -374,7 +400,7 @@ EOF
 cmd_list() {
   [ "$(role)" = core ] || die "the registry is on the core"
   ensure_registry
-  column -s, -t < "$PEERS"
+  { echo "KIND,NAME,ADDRESS,ACTIVE"; peers_rows | awk -F, -v OFS=, '{print $1, $2, $4, $5}'; } | column -s, -t
 }
 
 cmd_info() {
@@ -382,43 +408,28 @@ cmd_info() {
     core)
       load_env core
       cat <<EOF
-Core tunnel public key : $(cat "$WG_DIR/public.key")
-Core tunnel endpoint   : ${PUBLIC_IP}:${WG_PORT:-51820}
-Next free sensor addr  : $(next_free 11 250)
-Next free admin addr   : $(next_free 2 10)
+Dashboard        : https://${DOMAIN}
+Admin addresses  : $(enabled admin | join_list)
+Sensors          : $(peers_rows | awk -F, '$1=="sensor" && $5=="yes"' | wc -l) active
 
-New sensor:  sudo ./install.sh sensor --core ${PUBLIC_IP} --core-key $(cat "$WG_DIR/public.key") --tunnel-ip $(next_free 11 250)
+Add a sensor     : sudo getarp-ctl sensor add <name> <sensor public ip>
+Allow an admin   : sudo getarp-ctl admin add <name> <your public ip>
 EOF
       ;;
     sensor)
       load_env sensor
       cat <<EOF
-Sensor name            : ${NAME}
-Sensor tunnel address  : ${TUNNEL_IP}
-Sensor tunnel key      : $(cat "$WG_DIR/public.key")
-Sensor public address  : ${PUBLIC_IP:-unknown}
-
-Register it on the core:
-  sudo getarp-ctl sensor add ${NAME} ${TUNNEL_IP} $(cat "$WG_DIR/public.key") ${PUBLIC_IP:-<public-ip>}
+Core             : ${CORE_URL} (${CORE_IP})
+This sensor      : ${PUBLIC_IP:-unknown} on ${PUBLIC_IFACE}
+Admin SSH from   : ${ADMIN_CIDR:-nowhere}
 EOF
       ;;
   esac
 }
 
-next_free() { # lowest unused last octet in [lo, hi]
-  ensure_registry
-  local used n
-  used=$(peers_rows | cut -d, -f3 | sed 's/^10\.66\.0\.//' | sort -n | tr '\n' ' ')
-  for ((n = $1; n <= $2; n++)); do
-    [[ " $used " == *" $n "* ]] || { echo "10.66.0.$n"; return; }
-  done
-  echo "none left"
-}
-
 age() { # seconds -> short text
   local s=$1
-  if [ "$s" -lt 0 ]; then echo "never"
-  elif [ "$s" -lt 120 ]; then echo "${s}s"
+  if [ "$s" -lt 120 ]; then echo "${s}s"
   elif [ "$s" -lt 7200 ]; then echo "$((s / 60))m"
   else echo "$((s / 3600))h"; fi
 }
@@ -437,19 +448,14 @@ cmd_status() {
     core)
       load_env core
       echo "Services"
-      unit_line wg-quick@wg0 getarp-firewall "postgresql@${PG_MAJOR:-17}-main" redis-server crowdsec \
-        crowdsec-firewall-bouncer getarp-ingest getarp@pipeline getarp@enrichment \
-        getarp@analytics getarp@api caddy
+      unit_line getarp-firewall "postgresql@${PG_MAJOR:-17}-main" crowdsec crowdsec-firewall-bouncer \
+        getarp-ingest getarp@pipeline getarp@enrichment getarp@api caddy
       echo
       echo "Sensors"
-      printf '  %-10s %-12s %-10s %-12s %s\n' NAME TUNNEL HANDSHAKE LAST-EVENT EVENTS
-      declare -A hs=()
-      local key ts
-      while read -r key ts; do hs[$key]=$ts; done < <(wg show wg0 latest-handshakes 2>/dev/null || true)
-      local kind name ip pub en last count
-      while IFS=, read -r kind name ip key pub en; do
+      printf '  %-12s %-16s %-12s %s\n' NAME ADDRESS LAST-EVENT EVENTS
+      local kind name addr en last count
+      while IFS=, read -r kind name _ addr en; do
         [ "$kind" = sensor ] && [ "$en" = yes ] || continue
-        ts=${hs[$key]:-0}
         read -r last count < <(python3 -I -c '
 import json, sys
 try:
@@ -457,9 +463,8 @@ try:
 except Exception:
     s = {}
 print(s.get("last_seen") or 0, s.get("accepted", 0))' "$LIB/ingest/status.json" "$name")
-        printf '  %-10s %-12s %-10s %-12s %s\n' "$name" "$ip" \
-          "$( [ "$ts" -gt 0 ] && age $((now - ts)) || echo never)" \
-          "$( [ "$last" -gt 0 ] && age $((now - last)) || echo never)" "$count"
+        printf '  %-12s %-16s %-12s %s\n' "$name" "$addr" \
+          "$( [ "$last" -gt 0 ] && echo "$(age $((now - last))) ago" || echo never)" "$count"
       done < <(peers_rows)
       echo
       echo "Disk"
@@ -467,10 +472,10 @@ print(s.get("last_seen") or 0, s.get("accepted", 0))' "$LIB/ingest/status.json" 
       ;;
     sensor)
       echo "Services"
-      unit_line wg-quick@wg0 getarp-firewall getarp-cowrie getarp-decoys getarp-suricata getarp-shipper
+      unit_line getarp-firewall getarp-cowrie getarp-decoys getarp-suricata getarp-shipper
       echo
-      local ts; ts=$(wg show wg0 latest-handshakes 2>/dev/null | awk '{print $2; exit}')
-      echo "Tunnel to the core: last handshake $( [ "${ts:-0}" -gt 0 ] && age $((now - ts)) || echo never) ago"
+      echo "Delivery to the core (latest shipper message):"
+      echo "  $(journalctl -u getarp-shipper -n 1 --no-pager -o cat 2>/dev/null || echo unknown)"
       ;;
   esac
 }
@@ -480,7 +485,7 @@ cmd_backup() {
   [ "$(role)" = core ] || die "backups run on the core"
   local dir=/var/backups/getarp stamp; stamp=$(date -u +%Y%m%dT%H%M%SZ)
   install -d -m 0700 "$dir"
-  runuser -u postgres -- pg_dump -Fc getarp > "$dir/getarp-$stamp.dump"
+  (cd / && runuser -u postgres -- pg_dump -Fc getarp) > "$dir/getarp-$stamp.dump"
   chmod 0600 "$dir/getarp-$stamp.dump"
   find "$dir" -name 'getarp-*.dump' -mtime +7 -delete
   say "backup written: $dir/getarp-$stamp.dump"
@@ -509,15 +514,15 @@ cmd_password() {
   [ ${#pw} -ge 12 ] || die "use at least 12 characters"
   local hash
   hash=$(printf '%s' "$pw" | /opt/getarp/venv/bin/python -I -c \
-    'import sys; from passlib.context import CryptContext; print(CryptContext(schemes=["bcrypt"]).hash(sys.stdin.read()))')
+    'import sys, bcrypt; print(bcrypt.hashpw(sys.stdin.read().encode(), bcrypt.gensalt()).decode())')
   (cd / && runuser -u postgres -- psql -X -q -v ON_ERROR_STOP=1 -d getarp -v u="$user" -v h="$hash") <<'SQL'
-INSERT INTO users (username, password_hash, role) VALUES (:'u', :'h', 'admin')
+INSERT INTO users (username, password_hash) VALUES (:'u', :'h')
 ON CONFLICT (username) DO UPDATE SET password_hash = EXCLUDED.password_hash;
 SQL
   say "password set for $user"
 }
 
-usage() { sed -n '2,19p' "$0" | sed 's/^# \{0,1\}//'; }
+usage() { sed -n '2,20p' "$0" | sed 's/^# \{0,1\}//'; }
 
 case ${1:-} in
   apply) cmd_apply ;;

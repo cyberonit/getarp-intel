@@ -1,0 +1,8 @@
+[Unit]
+Description=getarp: refresh the DB-IP Lite country and network data
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/getarp-geoip

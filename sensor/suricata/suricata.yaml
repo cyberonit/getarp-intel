@@ -34,6 +34,8 @@ outputs:
       enabled: yes
       filetype: regular
       filename: eve.json
+      # Only what the core uses. Flow, DNS and TLS records would be most of the
+      # volume and are never read.
       types:
         - alert:
             payload: yes
@@ -41,10 +43,6 @@ outputs:
             metadata: yes
         - http:
             extended: yes
-        - dns
-        - tls
-        - ssh
-        - flow
         - anomaly
   - stats:
       enabled: no

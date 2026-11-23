@@ -1,56 +1,73 @@
-import React, { useState } from 'react'
-import { api } from './lib/api.js'
-import Dashboard from './components/Dashboard.jsx'
-import Detail from './components/Detail.jsx'
-import { Scans, Attacks, Behavior, Reports } from './components/Lists.jsx'
-import { Login, Settings } from './components/Admin.jsx'
+import React, { useEffect, useState } from 'react'
+import { api } from './api.js'
+import Overview from './components/Overview.jsx'
+import { Attacks, Behavior, Scans } from './components/Lists.jsx'
+import IpDetail from './components/IpDetail.jsx'
+import Login from './components/Login.jsx'
 
-const NAV = [
-  ['overview', 'OVERVIEW'],
-  ['scans', 'SCANS'],
-  ['attacks', 'ATTACKS'],
-  ['behavior', 'BEHAVIOR'],
-  ['reports', 'REPORTS'],
-  ['settings', 'SETTINGS'],
+const PAGES = [
+  ['overview', 'Overview'],
+  ['scans', 'Scans'],
+  ['attacks', 'Attacks'],
+  ['behavior', 'Behavior'],
 ]
 
 export default function App() {
-  const [view, setView] = useState('overview')
+  const [page, setPage] = useState(() => location.hash.slice(1) || 'overview')
+  const [who, setWho] = useState({ mode: 'public', user: null })
   const [pick, setPick] = useState(null)
-  const [authed, setAuthed] = useState(api.isAuthed())
+  const [showLogin, setShowLogin] = useState(false)
 
-  const needsAuth = view === 'settings'
-  if (needsAuth && !authed) return <Login onDone={() => setAuthed(true)} />
+  useEffect(() => { api.mode().then(setWho) }, [])
+  useEffect(() => {
+    const onHash = () => setPage(location.hash.slice(1) || 'overview')
+    window.addEventListener('hashchange', onHash)
+    return () => window.removeEventListener('hashchange', onHash)
+  }, [])
+
+  // Per-IP detail exists only on the admin site, after logging in.
+  const onPick = who.mode === 'admin' ? setPick : null
+  const go = (k) => { location.hash = k === 'overview' ? '' : k; setPage(k) }
 
   return (
     <div className="shell">
       <nav className="rail">
-        <div className="brand"><b>getarp</b> grid<small>deception intel</small></div>
-        <div style={{ height: 14 }} />
-        {NAV.map(([k, label]) => (
-          <div key={k} className={`nav-item ${view === k ? 'active' : ''}`}
-            onClick={() => setView(k)}>
-            <span>{label}</span>{k === 'settings' && <span>🔒</span>}
-          </div>
+        <div className="brand">
+          <div className="logo"><b>getarp</b> grid</div>
+          <div className="sub">deception intel</div>
+        </div>
+        {PAGES.map(([k, label]) => (
+          <button key={k} className={`nav ${page === k ? 'active' : ''}`} onClick={() => go(k)}>
+            {label}
+          </button>
         ))}
-        <div className="spacer" />
-        {authed && (
-          <div className="nav-item" onClick={() => { api.logout(); setAuthed(false); setView('overview') }}>
-            <span>SIGN OUT</span></div>
+        <div className="grow" />
+        {who.mode === 'guest' && (
+          <button className="nav" onClick={() => setShowLogin(true)}>Sign in</button>
         )}
-        <div className="muted" style={{ fontSize: 10, marginTop: 10 }}>getarp.net · v0.1</div>
+        {who.mode === 'admin' && (
+          <button className="nav" onClick={async () => { await api.logout(); setWho({ mode: 'guest' }) }}>
+            Sign out <span className="faint">{who.user}</span>
+          </button>
+        )}
+        <div className="foot">
+          getarp.net · v2.0<br />
+          <a href="https://db-ip.com" target="_blank" rel="noopener noreferrer">IP data by DB-IP</a>
+        </div>
       </nav>
 
       <main className="main">
-        {view === 'overview' && <Dashboard onPick={setPick} />}
-        {view === 'scans' && <Scans onPick={setPick} />}
-        {view === 'attacks' && <Attacks onPick={setPick} />}
-        {view === 'behavior' && <Behavior onPick={setPick} />}
-        {view === 'reports' && <Reports />}
-        {view === 'settings' && <Settings />}
+        {page === 'overview' && <Overview onPick={onPick} />}
+        {page === 'scans' && <Scans onPick={onPick} />}
+        {page === 'attacks' && <Attacks onPick={onPick} />}
+        {page === 'behavior' && <Behavior onPick={onPick} />}
       </main>
 
-      {pick && <Detail ip={pick} onClose={() => setPick(null)} />}
+      {pick && <IpDetail ip={pick} onClose={() => setPick(null)} />}
+      {showLogin && (
+        <Login onClose={() => setShowLogin(false)}
+          onDone={(user) => { setWho({ mode: 'admin', user }); setShowLogin(false) }} />
+      )}
     </div>
   )
 }

@@ -1,33 +1,32 @@
 #!/usr/bin/env bash
 # getarp PoC installer: Ubuntu 24.04 LTS on amd64 or arm64. No containers.
 #
-#   Core (the dashboard, database and analytics; install this first):
+#   Core (the dashboard, database and analysis; install this first):
 #     sudo ./install.sh core --domain getarp.net --email you@example.com
 #
-#   Sensor (a honeypot; as many as you like, each on its own machine):
-#     sudo ./install.sh sensor --core <core public ip> --core-key <core tunnel key> \
-#                              --tunnel-ip 10.66.0.11
+#   Sensor (a honeypot; as many as you like, each on its own machine). First
+#   register it on the core, which prints this exact command with its key:
+#     sudo getarp-ctl sensor add s01 <sensor public ip>                (on the core)
+#     sudo ./install.sh sensor --core https://getarp.net --key <key>   (on the sensor)
 #
-#   "sudo getarp-ctl info" on the core prints the exact sensor command.
 #   Safe to run again: keys, passwords and data are kept.
 #
 # Options, core:
 #   --domain NAME        public name of the dashboard (DNS must point here)   [required]
 #   --email ADDRESS      contact for the Let's Encrypt certificate              [required]
-#   --admin-user NAME    first dashboard admin (default: admin)
-#   --admin-domain NAME  admin site, reachable only through the tunnel (default: admin.getarp.internal)
+#   --admin-user NAME    first dashboard login (default: admin)
+#   --admin-cidr CIDR    where admins sign in from, comma separated (default: the
+#                        address you are connected from; more later: getarp-ctl admin add)
 #   --public-ip IP       this machine's public address (default: detected)
-#   --bind-ip IP         local address the public site listens on (default: detected)
+#   --bind-ip IP         local address the site listens on (default: detected)
 #   --ssh-port N         SSH port(s) to keep open, comma separated (default: detected)
 #   --backup-s3 URI      also copy the nightly backup to s3://bucket/prefix (optional)
 #
 # Options, sensor:
-#   --core IP            the core's public address                              [required]
-#   --core-key KEY       the core's tunnel public key                           [required]
-#   --tunnel-ip IP       this sensor's tunnel address, 10.66.0.11 to .250       [required]
-#   --name NAME          sensor name (default: s<last digits of the tunnel address>)
-#   --admin-cidr CIDR    who may SSH to port 2022 from the internet (default: the
-#                        address you are connected from; "none" = tunnel only)
+#   --core URL           the core, e.g. https://getarp.net                     [required]
+#   --key KEY            this sensor's key, from "getarp-ctl sensor add"        [required]
+#   --admin-cidr CIDR    who may reach the real SSH from the internet, comma separated
+#                        (default: the address you are connected from)
 #   --iface NAME         public network interface (default: detected)
 #   --public-ip IP       this machine's public address (default: detected)
 # shellcheck disable=SC2015
@@ -35,7 +34,6 @@ set -euo pipefail
 
 HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 PG_MAJOR=17
-WG_PORT=51820
 COWRIE_REPO=https://github.com/cowrie/cowrie.git
 COWRIE_REF=v3.1.7
 COWRIE_COMMIT=8e36327f6a24abe379dac807cc7e8b2d2fb01248
@@ -108,13 +106,8 @@ caller_ip() { # address of the SSH session running this installer, if any
   [[ "$ip" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]] && echo "$ip" || true
 }
 
-wg_keys() {
-  install -d -m 0700 /etc/wireguard
-  if [ ! -s /etc/wireguard/private.key ]; then
-    (umask 077; wg genkey > /etc/wireguard/private.key)
-  fi
-  wg pubkey < /etc/wireguard/private.key > /etc/wireguard/public.key
-  chmod 0644 /etc/wireguard/public.key
+valid_cidr_list() { # a.b.c.d[/n][,...]
+  [[ "$1" =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}(/[0-9]{1,2})?(,[0-9]{1,3}(\.[0-9]{1,3}){3}(/[0-9]{1,2})?)*$ ]]
 }
 
 install_ctl() {
@@ -128,14 +121,14 @@ install_ctl() {
 
 # ================================================================= CORE
 core_main() {
-  local DOMAIN="" EMAIL="" ADMIN_USER=admin ADMIN_DOMAIN=admin.getarp.internal
+  local DOMAIN="" EMAIL="" ADMIN_USER=admin ADMIN_CIDR=""
   local PUBLIC_IP="" BIND_IP="" SSH_PORTS="" BACKUP_S3_URI=""
   while [ $# -gt 0 ]; do
     case $1 in
       --domain) DOMAIN=$2; shift 2 ;;
       --email) EMAIL=$2; shift 2 ;;
       --admin-user) ADMIN_USER=$2; shift 2 ;;
-      --admin-domain) ADMIN_DOMAIN=$2; shift 2 ;;
+      --admin-cidr) ADMIN_CIDR=$2; shift 2 ;;
       --public-ip) PUBLIC_IP=$2; shift 2 ;;
       --bind-ip) BIND_IP=$2; shift 2 ;;
       --ssh-port) SSH_PORTS=$2; shift 2 ;;
@@ -148,13 +141,14 @@ core_main() {
   [ -n "$EMAIL" ] || die "--email is required (for the Let's Encrypt certificate)"
   [[ "$ADMIN_USER" =~ ^[A-Za-z0-9._-]{1,32}$ ]] || die "--admin-user: letters, digits, . _ - only"
   [[ -z "$BACKUP_S3_URI" || "$BACKUP_S3_URI" == s3://* ]] || die "--backup-s3 must look like s3://bucket/prefix"
+  [ -z "$ADMIN_CIDR" ] || valid_cidr_list "$ADMIN_CIDR" || die "--admin-cidr: e.g. 203.0.113.7 or 203.0.113.0/24"
   preflight core
 
   # ------------------------------------------------------------ packages
-  step "Packages (PostgreSQL $PG_MAJOR + TimescaleDB, Redis, Caddy, CrowdSec, WireGuard)"
+  step "Packages (PostgreSQL $PG_MAJOR + TimescaleDB, Caddy, CrowdSec)"
   apt-get update -q
-  apt_install ca-certificates curl gnupg openssl wireguard-tools nftables python3 python3-venv \
-    python3-boto3 logrotate postgresql-common redis-server caddy nodejs npm iproute2
+  apt_install ca-certificates curl gnupg openssl nftables python3 python3-venv \
+    python3-boto3 logrotate postgresql-common caddy nodejs npm iproute2
   [ -f /etc/apt/sources.list.d/pgdg.list ] || /usr/share/postgresql-common/pgdg/apt.postgresql.org.sh -y
   add_apt_repo timescaledb https://packagecloud.io/timescale/timescaledb/gpgkey \
     "https://packagecloud.io/timescale/timescaledb/ubuntu/ noble main"
@@ -180,6 +174,14 @@ core_main() {
   SSH_PORTS=${SSH_PORTS//[[:space:]]/}
   [[ "$SSH_PORTS" =~ ^[0-9]+(,[0-9]+)*$ ]] || die "could not work out the SSH port; pass --ssh-port"
   say "public IP $PUBLIC_IP, site listens on $BIND_IP, SSH kept open on ${SSH_PORTS//,/, }"
+  if [ -z "$ADMIN_CIDR" ] && ! grep -q '^admin,' "$ETC/peers.csv" 2>/dev/null; then
+    ADMIN_CIDR=$(caller_ip)
+    if [ -n "$ADMIN_CIDR" ]; then
+      say "admin access from $ADMIN_CIDR (the address you are connected from)"
+    else
+      warn "could not tell your address; allow one later with: getarp-ctl admin add <name> <ip>"
+    fi
+  fi
 
   # ------------------------------------------------------------ accounts and folders
   step "Accounts and folders"
@@ -188,9 +190,8 @@ core_main() {
   sys_group getarp-logs
   sys_user getarp-ingest /var/lib/getarp/ingest
   local s
-  for s in pipeline enrichment analytics api; do
+  for s in pipeline enrichment api; do
     sys_user "svc-$s" /nonexistent
-    usermod -a -G redis "svc-$s"
   done
   usermod -a -G getarp-logs svc-pipeline
   install -d -m 0755 /var/lib/getarp
@@ -208,13 +209,8 @@ core_main() {
 # getarp core secrets. Made by install.sh; keep this file root-only.
 PG_PW_PIPELINE=$(rand)
 PG_PW_ENRICHMENT=$(rand)
-PG_PW_ANALYTICS=$(rand)
 PG_PW_API=$(rand)
-RD_PW_PIPELINE=$(rand)
-RD_PW_ENRICHMENT=$(rand)
-RD_PW_ANALYTICS=$(rand)
-RD_PW_API=$(rand)
-JWT_SECRET=$(rand)$(rand)
+SESSION_SECRET=$(rand)$(rand)
 ADMIN_PASSWORD=$(openssl rand -base64 18 | tr -d '/+=' | cut -c1-20)
 EOF
     )
@@ -225,32 +221,32 @@ EOF
   # shellcheck disable=SC1091
   . "$ETC/secrets.env"
 
-  # ------------------------------------------------------------ tunnel and firewall
-  step "Tunnel (WireGuard 10.66.0.1, UDP $WG_PORT) and firewall"
-  wg_keys
+  # ------------------------------------------------------------ firewall
+  step "Firewall and web server config"
   cat > "$ETC/core.env" <<EOF
 # getarp core settings. Read by getarp-ctl. Re-run install.sh to change them.
 DOMAIN=$DOMAIN
 EMAIL=$EMAIL
-ADMIN_DOMAIN=$ADMIN_DOMAIN
 PUBLIC_IP=$PUBLIC_IP
 BIND_IP=$BIND_IP
 SSH_PORTS="${SSH_PORTS//,/, }"
-WG_PORT=$WG_PORT
 PG_MAJOR=$PG_MAJOR
 BACKUP_S3_URI=$BACKUP_S3_URI
 EOF
   chmod 0644 "$ETC/core.env"
   install_ctl
-  # admin laptops reach sensors' SSH through the core; Redis wants overcommit
-  printf "net.ipv4.ip_forward = 1\nvm.overcommit_memory = 1\n" > /etc/sysctl.d/60-getarp.conf
+  printf "vm.overcommit_memory = 1\n" > /etc/sysctl.d/60-getarp.conf
   sysctl -q -p /etc/sysctl.d/60-getarp.conf
   systemctl daemon-reload
-  getarp-ctl apply
+  [ -f /etc/caddy/Caddyfile.orig ] || cp -a /etc/caddy/Caddyfile /etc/caddy/Caddyfile.orig 2>/dev/null || true
+  getarp-ctl apply >/dev/null
+  local cidr n=1
+  for cidr in ${ADMIN_CIDR//,/ }; do
+    while grep -q "^admin,admin$n," "$ETC/peers.csv"; do n=$((n + 1)); done
+    getarp-ctl admin add "admin$n" "$cidr" >/dev/null || warn "could not add admin address $cidr"
+  done
   systemctl enable --now getarp-firewall.service
-  systemctl enable wg-quick@wg0.service
-  systemctl restart wg-quick@wg0.service
-  say "tunnel up; this core's tunnel key: $(cat /etc/wireguard/public.key)"
+  say "firewall on"
 
   # ------------------------------------------------------------ database
   step "Database (PostgreSQL $PG_MAJOR + TimescaleDB)"
@@ -267,70 +263,60 @@ listen_addresses = 'localhost'
 timescaledb.telemetry_level = off
 EOF
   systemctl restart "postgresql@$PG_MAJOR-main"
-
   for _ in $(seq 1 30); do pg_isready -q -h 127.0.0.1 && break; sleep 1; done
   psql_pg() { (cd / && runuser -u postgres -- psql -X -q -v ON_ERROR_STOP=1 "$@"); }
   if [ -z "$(psql_pg -tAc "SELECT 1 FROM pg_database WHERE datname = 'getarp'")" ]; then
     psql_pg -c "CREATE DATABASE getarp"
   fi
-  if [ -z "$(psql_pg -d getarp -tAc "SELECT to_regclass('public.events')")" ]; then
-    psql_pg -d getarp < "$HERE/app/db/init.sql" >/dev/null
-    say "schema created"
-  else
-    say "schema already there; kept"
-  fi
-  psql_pg -d getarp \
-    -v pw_pipeline="$PG_PW_PIPELINE" -v pw_enrichment="$PG_PW_ENRICHMENT" \
-    -v pw_analytics="$PG_PW_ANALYTICS" -v pw_api="$PG_PW_API" <<'SQL'
+  # Schema changes are numbered files in app/migrations; each runs once.
+  psql_pg -d getarp -c "CREATE TABLE IF NOT EXISTS schema_migrations (
+      name text PRIMARY KEY, applied_at timestamptz NOT NULL DEFAULT now())"
+  local m name
+  for m in "$HERE"/app/migrations/*.sql; do
+    name=$(basename "$m")
+    if [ -z "$(psql_pg -d getarp -tAc "SELECT 1 FROM schema_migrations WHERE name = '$name'")" ]; then
+      { echo "BEGIN;"; cat "$m"; echo "INSERT INTO schema_migrations (name) VALUES ('$name');"
+        echo "COMMIT;"; } | psql_pg -d getarp >/dev/null
+      say "applied $name"
+    fi
+  done
+  # One login per service, with only the rights it needs.
+  psql_pg -d getarp -v pw_pipeline="$PG_PW_PIPELINE" -v pw_enrichment="$PG_PW_ENRICHMENT" \
+    -v pw_api="$PG_PW_API" <<'SQL'
 SELECT 'CREATE ROLE ' || r || ' LOGIN'
-  FROM unnest(ARRAY['svc_pipeline', 'svc_enrichment', 'svc_analytics', 'svc_api']) AS r
+  FROM unnest(ARRAY['svc_pipeline', 'svc_enrichment', 'svc_api']) AS r
  WHERE NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = r) \gexec
 ALTER ROLE svc_pipeline   PASSWORD :'pw_pipeline';
 ALTER ROLE svc_enrichment PASSWORD :'pw_enrichment';
-ALTER ROLE svc_analytics  PASSWORD :'pw_analytics';
 ALTER ROLE svc_api        PASSWORD :'pw_api';
 REVOKE ALL ON DATABASE getarp FROM PUBLIC;
-GRANT CONNECT ON DATABASE getarp TO svc_pipeline, svc_enrichment, svc_analytics, svc_api;
-GRANT USAGE ON SCHEMA public TO svc_pipeline, svc_enrichment, svc_analytics, svc_api;
-GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public
-  TO svc_pipeline, svc_enrichment, svc_analytics, svc_api;
-GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA public
-  TO svc_pipeline, svc_enrichment, svc_analytics, svc_api;
-ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT SELECT, INSERT, UPDATE, DELETE ON TABLES
-  TO svc_pipeline, svc_enrichment, svc_analytics, svc_api;
-ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT USAGE, SELECT ON SEQUENCES
-  TO svc_pipeline, svc_enrichment, svc_analytics, svc_api;
+GRANT CONNECT ON DATABASE getarp TO svc_pipeline, svc_enrichment, svc_api;
+GRANT USAGE ON SCHEMA public TO svc_pipeline, svc_enrichment, svc_api;
+-- pipeline: writes events and everything derived from them
+GRANT SELECT, INSERT, UPDATE, DELETE ON events, ips, ip_hourly, findings, profiles, status TO svc_pipeline;
+GRANT USAGE ON ALL SEQUENCES IN SCHEMA public TO svc_pipeline;
+-- enrichment: reads and annotates addresses
+GRANT SELECT, UPDATE ON ips TO svc_enrichment;
+-- api: reads everything, writes nothing
+GRANT SELECT ON events, ips, ip_hourly, findings, profiles, status, users TO svc_api;
 SQL
-  say "service roles ready"
-
-  # ------------------------------------------------------------ redis
-  step "Redis (unix socket only, one user per service)"
-  install -m 0644 "$HERE/core/redis-getarp.conf" /etc/redis/getarp.conf
-  grep -q '^include /etc/redis/getarp.conf' /etc/redis/redis.conf \
-    || echo "include /etc/redis/getarp.conf" >> /etc/redis/redis.conf
-  (
-    umask 027
-    cat > /etc/redis/getarp-users.acl <<EOF
-user default off
-user svc-pipeline on >$RD_PW_PIPELINE ~* &* +@all -@admin -@dangerous
-user svc-enrichment on >$RD_PW_ENRICHMENT ~* &* +@all -@admin -@dangerous
-user svc-analytics on >$RD_PW_ANALYTICS ~* &* +@all -@admin -@dangerous
-user svc-api on >$RD_PW_API resetkeys resetchannels &status:live -@all +subscribe +unsubscribe +ping
-EOF
-  )
-  chown redis:redis /etc/redis/getarp-users.acl
-  systemctl enable redis-server
-  systemctl restart redis-server
+  say "service logins ready"
 
   # ------------------------------------------------------------ application
-  step "Application (pipeline, enrichment, analytics, API)"
+  step "Application (pipeline, enrichment, API)"
   install -d -m 0755 "$OPT/app" "$OPT/core"
-  cp -a "$HERE/app/." "$OPT/app/"
-  rm -rf "$OPT/app/frontend"
+  rm -rf "$OPT/app/getarp"
+  cp -a "$HERE/app/getarp" "$HERE/app/migrations" "$HERE/app/requirements.txt" "$OPT/app/"
   chown -R root:root "$OPT/app"
   install -m 0755 "$HERE/core/getarp-ingest.py" "$OPT/core/getarp-ingest.py"
   [ -x "$OPT/venv/bin/python" ] || python3 -m venv "$OPT/venv"
   "$OPT/venv/bin/pip" install -q --disable-pip-version-check -r "$HERE/app/requirements.txt"
+
+  step "Country and network data (DB-IP Lite, free, monthly)"
+  install -m 0755 "$HERE/bin/getarp-geoip" /usr/local/sbin/getarp-geoip
+  if [ ! -s /var/lib/getarp/geoip/dbip-asn-lite.mmdb ]; then
+    getarp-geoip || warn "could not download it now; it retries monthly (run: sudo getarp-geoip)"
+  fi
 
   if [ ! -f "$ETC/app.env" ]; then
     cat > "$ETC/app.env" <<'EOF'
@@ -340,52 +326,67 @@ PG_HOST=127.0.0.1
 PG_PORT=5432
 PG_DB=getarp
 LOG_DIR=/var/lib/getarp/logs
-ENRICHMENT_PROVIDER=crowdsec
-JWT_EXPIRE_MINUTES=60
+GEOIP_DIR=/var/lib/getarp/geoip
+# Detection thresholds
+SWEEP_PORTS=4
+SWEEP_WINDOW=60
+BRUTE_ATTEMPTS=10
+BRUTE_WINDOW=120
 EOF
   fi
-  svc_env() { # name pg-user pg-pw rd-user rd-pw args...
-    local name=$1 pgu=$2 pgp=$3 rdu=$4 rdp=$5; shift 5
+  svc_env() { # name pg-user pg-pw args...
+    local name=$1 pgu=$2 pgp=$3; shift 3
+    local keep=""
+    # keep lines the operator added (e.g. threat-intel keys) below the marker
+    [ -f "$ETC/svc/$name.env" ] && keep=$(sed -n '/^# --- your settings/,$p' "$ETC/svc/$name.env" | tail -n +2)
     (
       umask 027
       cat > "$ETC/svc/$name.env" <<EOF
-# getarp@$name: own database and Redis login. Written by install.sh.
+# getarp@$name: its own database login. Written by install.sh.
 PG_USER=$pgu
 PG_PASSWORD=$pgp
-REDIS_URL=unix://$rdu:$rdp@/run/redis/redis-server.sock?db=0
-HOSTNAME=$name-1
 GETARP_ARGS=$*
+# --- your settings (kept when install.sh runs again)
+$keep
 EOF
     )
     chown "root:svc-$name" "$ETC/svc/$name.env"
   }
-  svc_env pipeline svc_pipeline "$PG_PW_PIPELINE" svc-pipeline "$RD_PW_PIPELINE" -u ingestor.py
-  svc_env enrichment svc_enrichment "$PG_PW_ENRICHMENT" svc-enrichment "$RD_PW_ENRICHMENT" -u worker.py
-  svc_env analytics svc_analytics "$PG_PW_ANALYTICS" svc-analytics "$RD_PW_ANALYTICS" -u engine.py
-  svc_env api svc_api "$PG_PW_API" svc-api "$RD_PW_API" -m uvicorn main:app --host 127.0.0.1 \
-    --port 8000 --proxy-headers --forwarded-allow-ips 127.0.0.1
-  cat >> "$ETC/svc/api.env" <<EOF
-JWT_SECRET=$JWT_SECRET
-ADMIN_USER=$ADMIN_USER
-ADMIN_PASSWORD=$ADMIN_PASSWORD
-EOF
-  # Optional threat-intel keys (CROWDSEC_CTI_KEY=, ABUSEIPDB_KEY=, ...) go in
-  # $ETC/svc/enrichment.env or in the admin site's settings page.
+  svc_env pipeline svc_pipeline "$PG_PW_PIPELINE" -m getarp.pipeline
+  svc_env enrichment svc_enrichment "$PG_PW_ENRICHMENT" -m getarp.enrich
+  svc_env api svc_api "$PG_PW_API" -m uvicorn getarp.api:app --host 127.0.0.1 --port 8000 \
+    --proxy-headers --forwarded-allow-ips 127.0.0.1 --no-server-header --log-level warning
+  sed -i "/^PG_PASSWORD=/a SESSION_SECRET=$SESSION_SECRET" "$ETC/svc/api.env"
+  if ! grep -q '^#.*CROWDSEC_CTI_KEY' "$ETC/svc/enrichment.env"; then
+    printf '%s\n' "# Threat-intel reputation (optional, pick one): CROWDSEC_CTI_KEY=... or ABUSEIPDB_KEY=..." \
+      "# REPUTATION_PER_DAY=40" >> "$ETC/svc/enrichment.env"
+  fi
 
   install -m 0644 "$HERE/core/systemd/getarp@.service" "$HERE/core/systemd/getarp-ingest.service" \
     "$HERE/core/systemd/getarp-backup.service" "$HERE/core/systemd/getarp-backup.timer" \
+    "$HERE/core/systemd/getarp-geoip.service" "$HERE/core/systemd/getarp-geoip.timer" \
     /etc/systemd/system/
   # Only enrichment talks to the internet (threat-intel lookups).
-  for s in pipeline analytics api; do
+  for s in pipeline api; do
     install -d -m 0755 "/etc/systemd/system/getarp@$s.service.d"
     printf '[Service]\nIPAddressAllow=localhost\nIPAddressDeny=any\n' \
       > "/etc/systemd/system/getarp@$s.service.d/10-no-internet.conf"
   done
-  printf '[Service]\nSupplementaryGroups=getarp-logs\n' \
-    > "/etc/systemd/system/getarp@pipeline.service.d/20-logs.conf"
+  printf '[Service]\nSupplementaryGroups=getarp-logs\nStateDirectory=getarp/pipeline\nStateDirectoryMode=0750\n' \
+    > "/etc/systemd/system/getarp@pipeline.service.d/20-logs-and-state.conf"
   systemctl daemon-reload
-  systemctl enable getarp-ingest getarp@pipeline getarp@enrichment getarp@analytics getarp@api
-  systemctl restart getarp-ingest getarp@pipeline getarp@enrichment getarp@analytics getarp@api
+  systemctl enable getarp-ingest getarp@pipeline getarp@enrichment getarp@api getarp-geoip.timer
+  systemctl restart getarp-ingest getarp@pipeline getarp@enrichment getarp@api
+
+  # First dashboard login, only if there is none yet.
+  if [ "$(psql_pg -d getarp -tAc "SELECT count(*) FROM users")" = 0 ]; then
+    local hash
+    hash=$(printf '%s' "$ADMIN_PASSWORD" | "$OPT/venv/bin/python" -I -c \
+      'import sys, bcrypt; print(bcrypt.hashpw(sys.stdin.read().encode(), bcrypt.gensalt()).decode())')
+    psql_pg -d getarp -v u="$ADMIN_USER" -v h="$hash" \
+      <<<"INSERT INTO users (username, password_hash) VALUES (:'u', :'h');"
+    say "first admin login created: $ADMIN_USER"
+  fi
 
   # ------------------------------------------------------------ web
   step "Dashboard (build the frontend, configure Caddy)"
@@ -397,76 +398,7 @@ EOF
   rm -rf /var/www/getarp.new && cp -a "$build/dist" /var/www/getarp.new
   rm -rf /var/www/getarp && mv /var/www/getarp.new /var/www/getarp
   rm -rf "$build"
-  [ -f /etc/caddy/Caddyfile.orig ] || cp -a /etc/caddy/Caddyfile /etc/caddy/Caddyfile.orig 2>/dev/null || true
-  cat > /etc/caddy/Caddyfile <<EOF
-# getarp. Written by install.sh; re-run it to change.
-{
-	email $EMAIL
-	skip_install_trust
-}
-
-(security_headers) {
-	header {
-		Strict-Transport-Security "max-age=31536000"
-		X-Content-Type-Options nosniff
-		X-Frame-Options DENY
-		Referrer-Policy no-referrer
-		-Server
-	}
-}
-
-(spa) {
-	root * /var/www/getarp
-	try_files {path} /index.html
-	file_server
-}
-
-# Public dashboard: read-only routes only. Log-in, admin, per-IP detail and
-# reports exist only on the admin site.
-$DOMAIN {
-	bind $BIND_IP
-	encode gzip
-	import security_headers
-	log {
-		output file /var/log/caddy/access.log {
-			roll_size 50MiB
-			roll_keep 5
-		}
-	}
-	@public_api path /api/status /api/status/history /api/map /api/health /api/ws/status /api/ips /api/scans /api/attacks /api/behavior
-	handle @public_api {
-		reverse_proxy 127.0.0.1:8000
-	}
-	handle /api/* {
-		respond 404
-	}
-	handle {
-		import spa
-	}
-}
-
-# Admin site: only through the tunnel, certificate from Caddy's own CA.
-$ADMIN_DOMAIN {
-	bind 10.66.0.1
-	tls internal
-	encode gzip
-	import security_headers
-	handle /api/* {
-		reverse_proxy 127.0.0.1:8000
-	}
-	handle {
-		import spa
-	}
-}
-EOF
-  install -d -m 0755 /etc/systemd/system/caddy.service.d
-  printf '[Unit]\nAfter=wg-quick@wg0.service\nWants=wg-quick@wg0.service\n' \
-    > /etc/systemd/system/caddy.service.d/10-getarp.conf
-  caddy fmt --overwrite /etc/caddy/Caddyfile >/dev/null 2>&1 || true
-  # validate as caddy, so the admin site's CA is made where the service keeps it
-  runuser -u caddy -- env HOME=/var/lib/caddy caddy validate --adapter caddyfile \
-    --config /etc/caddy/Caddyfile >/dev/null 2>&1 \
-    || die "the Caddy config did not validate; run: caddy validate --config /etc/caddy/Caddyfile"
+  getarp-ctl apply >/dev/null   # writes and checks the web server config
   systemctl daemon-reload
   systemctl enable caddy
   systemctl restart caddy
@@ -500,17 +432,17 @@ EOF
   getarp-ctl status || true
   cat <<EOF
 
-  Public dashboard   https://$DOMAIN   (DNS: $DOMAIN A $PUBLIC_IP)
-  Admin site         https://$ADMIN_DOMAIN   (through the tunnel only)
+  Dashboard          https://$DOMAIN   (DNS: $DOMAIN A $PUBLIC_IP)
   First admin        $ADMIN_USER / $ADMIN_PASSWORD
                      (also in $ETC/admin-password; change it: sudo getarp-ctl password $ADMIN_USER)
+  Admin sign-in from $(getarp-ctl list | awk '$1=="admin" && $4=="yes" {print $3}' | paste -sd' ' -)
+                     (more: sudo getarp-ctl admin add <name> <ip>)
 
   Open these to the internet in your cloud firewall / security group:
-    TCP 80, 443   UDP $WG_PORT   and your SSH port(s): ${SSH_PORTS//,/, }
+    TCP 80, 443   and your SSH port(s): ${SSH_PORTS//,/, }
 
-  Next:
-    1. Add your laptop:   sudo getarp-ctl admin add laptop1 10.66.0.2 <laptop's tunnel public key>
-    2. Add a sensor:      sudo getarp-ctl info      (prints the exact sensor install command)
+  Next: add a sensor:   sudo getarp-ctl sensor add s01 <sensor public ip>
+        (it prints the key and the exact install command for the sensor)
 
   Full guide: $OPT/docs/USER_GUIDE.md      Install log: $INSTALL_LOG
 EOF
@@ -518,13 +450,11 @@ EOF
 
 # ================================================================= SENSOR
 sensor_main() {
-  local CORE_IP="" CORE_KEY="" TUNNEL_IP="" NAME="" ADMIN_CIDR="" IFACE="" PUBLIC_IP=""
+  local CORE_URL="" KEY="" ADMIN_CIDR="" IFACE="" PUBLIC_IP=""
   while [ $# -gt 0 ]; do
     case $1 in
-      --core) CORE_IP=$2; shift 2 ;;
-      --core-key) CORE_KEY=$2; shift 2 ;;
-      --tunnel-ip) TUNNEL_IP=$2; shift 2 ;;
-      --name) NAME=$2; shift 2 ;;
+      --core) CORE_URL=${2%/}; shift 2 ;;
+      --key) KEY=$2; shift 2 ;;
       --admin-cidr) ADMIN_CIDR=$2; shift 2 ;;
       --iface) IFACE=$2; shift 2 ;;
       --public-ip) PUBLIC_IP=$2; shift 2 ;;
@@ -532,36 +462,44 @@ sensor_main() {
       *) die "unknown option for sensor: $1" ;;
     esac
   done
-  [[ "$CORE_IP" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]] || die "--core <the core's public IPv4 address> is required"
-  [[ "$CORE_KEY" =~ ^[A-Za-z0-9+/]{42}[AEIMQUYcgkosw048]=$ ]] \
-    || die "--core-key is required: the core's tunnel public key (sudo getarp-ctl info on the core)"
-  [[ "$TUNNEL_IP" =~ ^10\.66\.0\.([0-9]{1,3})$ ]] || die "--tunnel-ip must be 10.66.0.N (11 to 250)"
-  local n=${BASH_REMATCH[1]}
-  { [ "$n" -ge 11 ] && [ "$n" -le 250 ]; } || die "--tunnel-ip must be 10.66.0.11 to 10.66.0.250"
-  [ -n "$NAME" ] || NAME=$(printf 's%02d' $((n - 10)))
-  [[ "$NAME" =~ ^[a-z][a-z0-9-]{1,30}$ ]] || die "--name: lowercase letters, digits and dashes, e.g. s01"
+  [[ "$CORE_URL" =~ ^https://[A-Za-z0-9.-]+$ ]] || die "--core https://<the core's name> is required"
+  [[ "$KEY" =~ ^[0-9a-f]{64}$ ]] \
+    || die "--key is required: the key \"getarp-ctl sensor add\" printed on the core"
+  [ -z "$ADMIN_CIDR" ] || valid_cidr_list "$ADMIN_CIDR" || die "--admin-cidr: e.g. 203.0.113.7 or 203.0.113.0/24"
   preflight sensor
 
   # ------------------------------------------------------------ packages
-  step "Packages (WireGuard, nftables, Suricata, Python)"
+  step "Packages (nftables, Suricata, Python)"
   apt-get update -q
-  apt_install ca-certificates curl openssl git wireguard-tools nftables python3 python3-venv \
+  apt_install ca-certificates curl openssl git nftables python3 python3-venv \
     suricata suricata-update logrotate iproute2
 
   # ------------------------------------------------------------ addresses
-  step "Addresses"
+  step "Addresses, and a test delivery to the core"
   [ -n "$IFACE" ] || IFACE=$(detect_iface)
   [ -n "$IFACE" ] && ip link show "$IFACE" >/dev/null 2>&1 || die "could not find the public interface; pass --iface"
   [ -n "$PUBLIC_IP" ] || PUBLIC_IP=$(detect_public_ip)
-  [ -n "$PUBLIC_IP" ] || warn "could not detect the public IP; registration will need it"
+  local host=${CORE_URL#https://} core_ip
+  core_ip=$(getent ahostsv4 "$host" | awk 'NR==1 {print $1}')
+  [ -n "$core_ip" ] || die "cannot resolve $host"
   if [ -z "$ADMIN_CIDR" ]; then
-    local me; me=$(caller_ip)
-    [ -n "$me" ] || die "could not tell which address you are connected from. Pass --admin-cidr <your IP>/32
-       (who may SSH to port 2022 from the internet), or --admin-cidr none for tunnel-only SSH."
-    ADMIN_CIDR="$me/32"
+    ADMIN_CIDR=$(caller_ip)
+    [ -n "$ADMIN_CIDR" ] || die "could not tell which address you are connected from. Pass
+       --admin-cidr <your IP> (who may reach this machine's real SSH from the internet)."
   fi
-  [ "$ADMIN_CIDR" = none ] && ADMIN_CIDR=""
-  say "interface $IFACE, public IP ${PUBLIC_IP:-unknown}, admin SSH from ${ADMIN_CIDR:-the tunnel only}"
+  # An empty batch: proves the name, the certificate, the key and the address allowlist.
+  local code
+  code=$(curl -sS -o /dev/null -w '%{http_code}' --max-time 20 -X POST \
+    -H "Authorization: Bearer $KEY" --data-binary '' "$CORE_URL/ingest" || true)
+  case $code in
+    200) say "the core accepts this sensor" ;;
+    401) die "the core does not know this key (or the sensor was removed). Run on the core:
+       sudo getarp-ctl sensor add <name> ${PUBLIC_IP:-<this sensor public ip>}" ;;
+    404) die "the core does not accept deliveries from this address (${PUBLIC_IP:-unknown}). On the core:
+       sudo getarp-ctl sensor move <name> ${PUBLIC_IP:-<this sensor public ip>}" ;;
+    *) die "cannot reach $CORE_URL/ingest (answer: ${code:-none}); check DNS, its certificate and TCP 443" ;;
+  esac
+  say "interface $IFACE, public IP ${PUBLIC_IP:-unknown}, core $host ($core_ip), admin SSH from $ADMIN_CIDR"
 
   # ------------------------------------------------------------ accounts and folders
   step "Accounts and folders"
@@ -578,37 +516,20 @@ sensor_main() {
   install -d -m 2750 -o hpextra -g getarp-logs /var/log/getarp/extra
   install -d -m 2750 -o suricata -g getarp-logs /var/log/getarp/suricata
   install -d -m 0755 /var/lib/suricata /var/lib/suricata/rules
-
-  # ------------------------------------------------------------ tunnel
-  step "Tunnel to the core ($TUNNEL_IP -> 10.66.0.1)"
-  wg_keys
   cat > "$ETC/sensor.env" <<EOF
 # getarp sensor settings. Read by getarp-ctl and systemd. Re-run install.sh to change.
-NAME=$NAME
-TUNNEL_IP=$TUNNEL_IP
-CORE_IP=$CORE_IP
-WG_PORT=$WG_PORT
+CORE_URL=$CORE_URL
+CORE_IP=$core_ip
 PUBLIC_IFACE=$IFACE
 PUBLIC_IP=$PUBLIC_IP
 ADMIN_CIDR=$ADMIN_CIDR
 EOF
   chmod 0644 "$ETC/sensor.env"
   (
-    umask 077
-    cat > /etc/wireguard/wg0.conf <<EOF
-# Written by getarp install.sh.
-[Interface]
-Address = $TUNNEL_IP/32
-PrivateKey = $(cat /etc/wireguard/private.key)
-
-[Peer]
-# the getarp core
-PublicKey = $CORE_KEY
-Endpoint = $CORE_IP:$WG_PORT
-AllowedIPs = 10.66.0.0/24
-PersistentKeepalive = 25
-EOF
+    umask 027
+    printf 'GETARP_CORE_URL=%s\nGETARP_SENSOR_KEY=%s\n' "$CORE_URL" "$KEY" > "$ETC/shipper.env"
   )
+  chown root:getarp-ship "$ETC/shipper.env"
   install_ctl
 
   # ------------------------------------------------------------ cowrie
@@ -668,8 +589,6 @@ EOF
   systemctl daemon-reload
   getarp-ctl apply
   systemctl enable --now getarp-firewall.service
-  systemctl enable wg-quick@wg0.service
-  systemctl restart wg-quick@wg0.service
   local u
   for u in getarp-cowrie getarp-decoys getarp-suricata getarp-shipper; do
     systemctl enable "$u" >/dev/null 2>&1
@@ -682,15 +601,12 @@ EOF
   getarp-ctl status || true
   cat <<EOF
 
-  Now register this sensor ON THE CORE (copy the whole line):
-
-    sudo getarp-ctl sensor add $NAME $TUNNEL_IP $(cat /etc/wireguard/public.key) ${PUBLIC_IP:-<public IP of this sensor>}
-
-  Then, back here, "sudo getarp-ctl status" should show a handshake within a minute.
+  This sensor delivers to $CORE_URL. Attacks show on the dashboard within a
+  minute of the first scanner finding it ("sudo getarp-ctl status" on the core).
 
   Open these to the internet in your cloud firewall / security group:
     TCP 21, 22, 23, 80, 2222, 2223, 8080, 8081, 2121, 3306, 6379   (the decoys)
-    TCP 2022 from ${ADMIN_CIDR:-nowhere (tunnel only)}               (your real SSH)
+    TCP 2022 from ${ADMIN_CIDR//,/, } only                          (your real SSH)
   From now on, log in with:  ssh -p 2022 <user>@${PUBLIC_IP:-<sensor ip>}
 
   Full guide: $OPT/docs/USER_GUIDE.md      Install log: $INSTALL_LOG

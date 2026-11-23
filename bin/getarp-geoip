@@ -1,0 +1,24 @@
+#!/usr/bin/env bash
+# getarp-geoip: download the free DB-IP Lite databases (country, network).
+# Monthly files, CC BY 4.0, no account needed. IP data by DB-IP (https://db-ip.com).
+# The pipeline notices new files by itself; nothing to restart.
+set -euo pipefail
+DIR=${GETARP_GEOIP_DIR:-/var/lib/getarp/geoip}
+install -d -m 0755 "$DIR"
+tmp=$(mktemp -d); trap 'rm -rf "$tmp"' EXIT
+ok=0
+for kind in country asn; do
+  got=""
+  # This month's file appears in the first days of the month; fall back to last month's.
+  for month in "$(date -u +%Y-%m)" "$(date -u -d "$(date -u +%Y-%m-01) -1 day" +%Y-%m)"; do
+    url="https://download.db-ip.com/free/dbip-$kind-lite-$month.mmdb.gz"
+    if curl -fsSL --max-time 300 -o "$tmp/$kind.gz" "$url"; then got=$month; break; fi
+  done
+  if [ -z "$got" ]; then echo "getarp-geoip: could not download the $kind data" >&2; continue; fi
+  gunzip -c "$tmp/$kind.gz" > "$tmp/$kind.mmdb"
+  [ "$(stat -c %s "$tmp/$kind.mmdb")" -gt 1000000 ] || { echo "getarp-geoip: $kind file too small; kept the old one" >&2; continue; }
+  install -m 0644 "$tmp/$kind.mmdb" "$DIR/dbip-$kind-lite.mmdb"
+  echo "getarp-geoip: $kind data for $got installed"
+  ok=$((ok + 1))
+done
+[ "$ok" -gt 0 ]
