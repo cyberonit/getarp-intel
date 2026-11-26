@@ -86,6 +86,16 @@ SELECT
 """
 
 
+def _strip_nul(obj):
+    if isinstance(obj, str):
+        return obj.replace("\x00", "")
+    if isinstance(obj, dict):
+        return {_strip_nul(k): _strip_nul(v) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [_strip_nul(v) for v in obj]
+    return obj
+
+
 def threat_level(attacks_5m):
     if attacks_5m > 50:
         return "critical"
@@ -207,7 +217,7 @@ class Pipeline:
         for f in self.followers:
             for line in f.read(BATCH - len(events)):
                 try:
-                    rec = json.loads(line)
+                    rec = _strip_nul(json.loads(line))
                 except ValueError:
                     continue
                 ev = normalize(f.source, rec)
@@ -255,7 +265,7 @@ class Pipeline:
                 profile_rows.append((ip, a["sessions"], a["commands"][:50], sorted(a["tooling"]),
                                      tactics_for(a["tooling"])))
         finding_rows = [(f.ts, f.src_ip, f.kind, f.type, f.service, f.severity, f.sensor,
-                         json.dumps(f.detail, default=str)) for f in findings]
+                         json.dumps(_strip_nul(f.detail), default=str)) for f in findings]
 
         async with self.pool.acquire() as con:
             async with con.transaction():
